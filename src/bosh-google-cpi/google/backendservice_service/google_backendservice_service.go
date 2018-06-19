@@ -122,29 +122,33 @@ func (i GoogleBackendServiceService) RemoveInstance(vmLink string) error {
 // while trying to find the Backend Service.
 func (i GoogleBackendServiceService) find(id, region string) (BackendService, bool, error) {
 	i.logger.Debug(googleBackendServiceServiceLogTag, "Finding Google Backend Service %q", id)
-	var backendServiceItem *compute.BackendService
-	var err error
 
-	// First, attempt to find a global backend service
-	backendServiceItem, err = i.computeService.BackendServices.Get(i.project, id).Do()
+	// Search for a matching backend service amongst an aggregated list containing both global and regional items
+	aggregatedBackendServices, err := i.computeService.BackendServices.AggregatedList(i.project).Do()
+	// TODO(craigatgoogle): Employ server-side name filtering once the API filter bug is fixed, https://b.corp.google.com/issues/80238913
 	if err == nil {
-		backendService := BackendService{
-			Name:     backendServiceItem.Name,
-			SelfLink: backendServiceItem.SelfLink,
-			Backends: FromComputeBackends(backendServiceItem.Backends),
+		var backendService *compute.BackendService
+		for _, scopedList := range aggregatedBackendServices.Items {
+			for _, bs := range scopedList.BackendServices {
+				if bs.Name == id && (bs.Region == "" || strings.Contains(bs.Region, region)) {
+					// Ensure there doesn't exist a collision in names between global/regional backend services
+					if backendService != nil {
+						return BackendService{},
+							false,
+							bosherr.Errorf("Failed to find Google Backend Service %q, given ambiguous name.", id)
+					}
+					backendService = bs
+				}
+			}
 		}
-		return backendService, true, nil
-	}
 
-	// A global backend service wasn't found; look for a region backend service
-	backendServiceItem, err = i.computeService.RegionBackendServices.Get(i.project, region, id).Do()
-	if err == nil {
-		backendService := BackendService{
-			Name:     backendServiceItem.Name,
-			SelfLink: backendServiceItem.SelfLink,
-			Backends: FromComputeBackends(backendServiceItem.Backends),
+		if backendService != nil {
+			return BackendService{
+				Name:     backendService.Name,
+				SelfLink: backendService.SelfLink,
+				Backends: FromComputeBackends(backendService.Backends),
+			}, true, nil
 		}
-		return backendService, true, nil
 	}
 
 	if gerr, ok := err.(*googleapi.Error); ok && gerr.Code == 404 {
